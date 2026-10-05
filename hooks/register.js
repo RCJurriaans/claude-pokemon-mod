@@ -25,6 +25,7 @@ import { zoomFor, zoomedAt, zoomedPixel } from './zoom.js'
 // Each open session shows its own mon, starting with the one last picked anywhere. XP,
 // meters, nickname, and sleep belong to the mon, so sessions showing the same mon share them.
 // The mon, hearts, berries, bubbles, balls, and Zs are pixels in one Raster, two per cell.
+// The desktop has no Raster, so there the same cells are drawn as one Svg of square pixels.
 
 const TICK_MS = 50
 const MOVE_TICKS = 3
@@ -128,6 +129,10 @@ let evolving = null
 let evolveDue = null
 let joyHopAt = null
 let sentCells = null
+// The band's site on the desktop, redrawn whole since an Svg can't be blitted, and the
+// last frame drawn there
+let desktopId = null
+let sentSvg = null
 let maxRows = Infinity
 let ink = INKS.dark
 
@@ -833,6 +838,11 @@ function ghostPixel(ghosts, pixel, box, width, flip, baseX, baseTop) {
 
 // Pack the current frame into Raster cells, two pixels per cell with half blocks
 function cellsNow() {
+  return new Uint8Array(frameWords().words.buffer).toBase64()
+}
+
+// The current frame as Raster words, [codePoint, foreground, background] per cell
+function frameWords() {
   const playing = attack !== null && !isBackingUp()
   const age = attack ? tick - attack.start : 0
   const pose = playing ? attackPose(attack, age) : attack ? BACKING_POSE : NO_POSE
@@ -942,7 +952,64 @@ function cellsNow() {
       else words.set([SPACE, DEFAULT_COLOR, DEFAULT_COLOR], i)
     }
   }
-  return new Uint8Array(words.buffer).toBase64()
+  return { words, columns: zoom.columns, rows: zoom.rows }
+}
+
+// CSS pixels per sprite pixel on the desktop, about what a terminal cell's half shows
+const DESKTOP_PIXEL = 4
+// Redraw the desktop band at most every few ticks, as each frame is a full render pass
+const DESKTOP_FRAME_TICKS = 2
+
+const hex = (color) => '#' + color.toString(16).padStart(6, '0')
+const escapeXml = (text) => text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])
+
+// The current frame as SVG: each cell's two half-block pixels as squares, runs of one
+// color merged into one rect, the terminal's default color left transparent, and an
+// effect's glyphs as text on their cell's background
+function svgNow() {
+  const { words, columns: width, rows } = frameWords()
+  const pixelRows = Array.from({ length: rows * 2 }, () => new Array(width).fill(null))
+  const glyphs = []
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < width; cx++) {
+      const i = (cy * width + cx) * 3
+      const [code, fg, bg] = [words[i], words[i + 1], words[i + 2]]
+      const paint = (color) => (color === DEFAULT_COLOR ? null : color)
+      let [upper, lower] = [paint(bg), paint(bg)]
+      if (code === UPPER_HALF) upper = paint(fg)
+      else if (code === LOWER_HALF) lower = paint(fg)
+      else if (code !== SPACE) glyphs.push({ cx, cy, code, color: paint(fg) ?? ink.bubble })
+      pixelRows[cy * 2][cx] = upper
+      pixelRows[cy * 2 + 1][cx] = lower
+    }
+  }
+  const shapes = []
+  pixelRows.forEach((row, py) => {
+    for (let px = 0; px < width; ) {
+      const color = row[px]
+      let end = px + 1
+      while (end < width && row[end] === color) end++
+      if (color !== null) shapes.push(`<rect x="${px}" y="${py}" width="${end - px}" height="1" fill="${hex(color)}"/>`)
+      px = end
+    }
+  })
+  for (const g of glyphs) {
+    const char = escapeXml(String.fromCodePoint(g.code))
+    shapes.push(`<text x="${g.cx + 0.5}" y="${g.cy * 2 + 1.7}" font-size="2" text-anchor="middle" fill="${hex(g.color)}">${char}</text>`)
+  }
+  const source =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${rows * 2}" ` +
+    `width="${width * DESKTOP_PIXEL}" height="${rows * 2 * DESKTOP_PIXEL}" shape-rendering="crispEdges">` +
+    shapes.join('') +
+    '</svg>'
+  return { source, width: width * DESKTOP_PIXEL, height: rows * 2 * DESKTOP_PIXEL }
+}
+
+// Ask for a redraw of the desktop band when its frame changed since the last one drawn
+function redrawDesktop($) {
+  if (!bandZoom()) return
+  if (svgNow().source === sentSvg) return
+  $.ui.invalidate('ui.render')
 }
 
 // Where a mon pacing right while Claude works turns back: before its bubble, which leads
@@ -1524,6 +1591,7 @@ export function register(on) {
         if (tick % SYNC_TICKS === 0) syncSessions($).catch((err) => logOnce($, err))
         if (tick % BEAT_TICKS === 0) beat($, lastBeat).catch((err) => logOnce($, err))
         if (bandId !== null) blitFrame($)
+        else if (desktopId !== null && tick % DESKTOP_FRAME_TICKS === 0) redrawDesktop($)
       } catch (err) {
         logOnce($, err)
       }
@@ -1717,15 +1785,19 @@ export function register(on) {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.surface !== 'terminal' || e.props.hasSurvey) {
+    const onDesktop = e.surface === 'desktop'
+    if ((e.surface !== 'terminal' && !onDesktop) || e.props.hasSurvey) {
       bandId = null
+      desktopId = null
       return next(e)
     }
-    const { Box, Raster, Text } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text } = elements
     const wasHome = isHome()
     working = e.props.isWorking
     if (!working) thinking = false
-    bandId = e.requestId
+    bandId = onDesktop ? null : e.requestId
+    desktopId = onDesktop ? e.requestId : null
     maxRows = e.props.maxRows
     // The panel goes over the scene's right end when the band shows at full size and
     // has room for it, and beside a shrunk band otherwise
@@ -1753,8 +1825,15 @@ export function register(on) {
     const zoom = bandZoom()
     let corner
     if (zoom) {
-      sentCells = cellsNow()
-      const sprite = Raster({ key: 'pokemon', columns: zoom.columns, rows: zoom.rows, cells: sentCells })
+      let sprite
+      if (onDesktop) {
+        const svg = svgNow()
+        sentSvg = svg.source
+        sprite = elements.Svg({ alt: nameOf(mon), source: svg.source, width: svg.width, height: svg.height })
+      } else {
+        sentCells = cellsNow()
+        sprite = elements.Raster({ key: 'pokemon', columns: zoom.columns, rows: zoom.rows, cells: sentCells })
+      }
       const meterLines = needsOn ? [level, meter('food'), meter('happiness')] : [level]
       if (panel > 0) {
         const meters = Box({ position: 'absolute', right: 0, bottom: 0, width: panel, paddingLeft: 1, flexDirection: 'column', children: meterLines })
@@ -1766,6 +1845,7 @@ export function register(on) {
     } else {
       // Too short even for a shrunk mon: its name, level, and meters on one line, and no blits
       bandId = null
+      desktopId = null
       const name = Text({ children: [nameOf(mon) + ' ' + levelLine()] })
       const meters = needsOn ? [meter('food', ' '), meter('happiness', ' ')] : []
       corner = [Box({ flexDirection: 'row', children: [name, ...meters] })]

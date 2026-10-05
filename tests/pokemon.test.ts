@@ -69,11 +69,23 @@ test('cells one color top and bottom are spaces on that color, so no font can le
   expect(solid).toBeGreaterThan(20)
 })
 
-test('leaves the band alone on desktop and during a survey', async ($, on) => {
+test('draws the mon as square SVG pixels on desktop, which has no Raster', async ($, on) => {
   on('ui.render', () => THEIRS)
-  const desktop = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect(await desktop.find({ key: 'pokemon' })).toBeUndefined()
-  await desktop.unmount()
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.drawn()
+  const svg = await ui.find({ type: 'Svg' })
+  expect(svg).toBeDefined()
+  expect(svg.props.alt).toBe('Abra')
+  expect(svg.props.source).toContain(`viewBox="0 0 ${RASTER} 22"`)
+  expect(svg.props.source).toContain('<rect ')
+  expect(svg.props.source.length).toBeLessThan(131072)
+})
+
+test('leaves the band alone on other surfaces and during a survey', async ($, on) => {
+  on('ui.render', () => THEIRS)
+  const vscode = await $.ui.mount({ ...BAND, surface: 'vscode' })
+  expect(await vscode.find({ key: 'pokemon' })).toBeUndefined()
+  await vscode.unmount()
   const survey = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, hasSurvey: true } })
   expect(await survey.find({ key: 'pokemon' })).toBeUndefined()
 })
